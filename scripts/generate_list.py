@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Scan lfkdsk.org subdomains via certificate transparency logs (crt.sh)
-and regenerate list.html.
+Scan lfkdsk.org subdomains via certificate transparency logs (crt.sh),
+filter to only live subdomains, and regenerate list.html.
 """
 import hashlib
 import json
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -51,8 +52,8 @@ def fetch_subdomains() -> list[str]:
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        print(f"ERROR fetching crt.sh: {exc}", file=sys.stderr)
-        sys.exit(1)
+        print(f"WARNING: crt.sh unavailable ({exc}), skipping discovery.", file=sys.stderr)
+        return []
 
     seen: set[str] = set()
     for entry in data:
@@ -67,8 +68,43 @@ def fetch_subdomains() -> list[str]:
             seen.add(name)
 
     result = sorted(seen)
-    print(f"Found {len(result)} subdomains: {', '.join(result)}")
+    print(f"Found {len(result)} subdomains via crt.sh: {', '.join(result)}")
     return result
+
+
+def is_alive(subdomain: str, timeout: int = 8) -> bool:
+    """Return True if the subdomain responds to an HTTP(S) request."""
+    for scheme in ("https", "http"):
+        try:
+            resp = requests.head(
+                f"{scheme}://{subdomain}",
+                timeout=timeout,
+                allow_redirects=True,
+                headers={"User-Agent": "subdomain-checker/1.0"},
+            )
+            # Any HTTP response means the host is up
+            print(f"  [alive]  {subdomain}  ({scheme}, {resp.status_code})")
+            return True
+        except requests.exceptions.ConnectionError:
+            pass
+        except requests.exceptions.Timeout:
+            pass
+        except Exception:
+            pass
+    print(f"  [dead]   {subdomain}")
+    return False
+
+
+def filter_alive(subdomains: list[str], workers: int = 10) -> list[str]:
+    """Check all subdomains in parallel, return only live ones."""
+    print(f"\nChecking liveness of {len(subdomains)} subdomains ...", flush=True)
+    alive: dict[str, bool] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_to_sub = {pool.submit(is_alive, s): s for s in subdomains}
+        for future in as_completed(future_to_sub):
+            sub = future_to_sub[future]
+            alive[sub] = future.result()
+    return sorted(s for s, ok in alive.items() if ok)
 
 
 def build_card(subdomain: str, meta: dict) -> str:
@@ -209,15 +245,18 @@ def main():
     # Supplement with crt.sh discoveries (catches new subdomains not yet in metadata)
     discovered = set(fetch_subdomains())
 
-    # Merge: known first (preserves order), then any new ones found by crt.sh
-    all_subdomains = sorted(known | discovered)
+    # Merge candidates
+    candidates = sorted(known | discovered)
 
-    if not all_subdomains:
-        print("No subdomains found, aborting.", file=sys.stderr)
+    # Keep only subdomains that are actually reachable right now
+    live = filter_alive(candidates)
+
+    if not live:
+        print("No live subdomains found, aborting.", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Total subdomains: {len(all_subdomains)}")
-    html = render(all_subdomains, meta)
+    print(f"\nLive subdomains ({len(live)}): {', '.join(live)}")
+    html = render(live, meta)
     OUTPUT_FILE.write_text(html)
     print(f"Written to {OUTPUT_FILE}")
 
